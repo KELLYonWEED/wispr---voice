@@ -12,6 +12,7 @@ export interface TranscriptItem {
 export interface AppSettings {
   groqApiKey: string;
   geminiApiKey: string;
+  preferredMicId?: string;
 }
 
 export interface AppHotkeys {
@@ -83,6 +84,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   saveSettings: (settings: Partial<AppSettings>): Promise<AppSettings> => {
     return ipcRenderer.invoke('save-settings', settings);
+  },
+  onMicChanged: (callback: (micId: string) => void) => {
+    const handler = (_event: any, micId: string) => callback(micId);
+    ipcRenderer.on('mic-changed', handler);
+    return () => ipcRenderer.removeListener('mic-changed', handler);
   },
   testApiKey: (provider: 'groq' | 'gemini', key: string): Promise<{ ok: boolean; latencyMs?: number; error?: string }> => {
     return ipcRenderer.invoke('test-api-key', { provider, key });

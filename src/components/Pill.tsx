@@ -35,6 +35,7 @@ const Pill: React.FC = () => {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animFrameRef = useRef<number | null>(null);
   const [waveHeights, setWaveHeights] = useState<[number, number, number]>([0.4, 0.8, 0.5]);
+  const preferredMicIdRef = useRef<string>('');
 
   // Mode picker state
   const [modePickerOpen, setModePickerOpen] = useState(false);
@@ -45,75 +46,107 @@ const Pill: React.FC = () => {
   // Labels of virtual loopback inputs that capture speaker output instead of
   // (or mixed with) the microphone — e.g. Windows "Stereo Mix". Recording
   // from one of these is how background YouTube audio ends up in dictation.
-  const LOOPBACK_LABEL_PATTERN = /stereo.?mix|what.?u.?hear|loopback|wave.?out|mono.?mix|system.?audio|desktop.?audio|virtual.?cable/i;
+  const LOOPBACK_LABEL_PATTERN = /stereo.?mix|what.?u.?hear|loopback|wave.?out|mono.?mix|system.?audio|desktop.?audio|virtual.?cable|cable.?output/i;
+
+  // Listen for preferred mic settings from main process
+  useEffect(() => {
+    window.electronAPI?.getSettings?.().then((settings) => {
+      if (settings?.preferredMicId) {
+        preferredMicIdRef.current = settings.preferredMicId;
+      }
+    })?.catch(() => {});
+
+    const unsubMic = window.electronAPI?.onMicChanged?.((micId: string) => {
+      preferredMicIdRef.current = micId;
+      if (activeStream.current) {
+        activeStream.current.getTracks().forEach(t => t.stop());
+        activeStream.current = null;
+      }
+    });
+
+    return () => {
+      unsubMic?.();
+    };
+  }, []);
 
   // Request a FRESH microphone stream every time. Never reuse a cached
   // stream — Chromium's AEC pipeline can silently degrade on a reused
   // MediaStream, causing speaker playback to bleed into dictation.
   const requestMicStream = async (): Promise<MediaStream> => {
-    // 1. Enumerate devices and pick a real physical microphone, skipping
-    //    any loopback/virtual-cable device that would capture speaker output.
     let deviceId: string | undefined;
     try {
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const audioInputs = devices.filter(d => d.kind === 'audioinput' && d.deviceId);
+      let devices = await navigator.mediaDevices.enumerateDevices();
+      let audioInputs = devices.filter(d => d.kind === 'audioinput' && d.deviceId);
 
-      // Log available inputs for diagnostics (visible in DevTools console)
-      console.log('[Mic] Available audio inputs:', audioInputs.map(d => `${d.label || '(unlabeled)'} [${d.deviceId.slice(0, 8)}]`));
+      // If device labels are blank, request a momentary audio stream to unlock labels
+      if (audioInputs.length > 0 && !audioInputs.some(d => d.label)) {
+        try {
+          const preStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          preStream.getTracks().forEach(t => t.stop());
+          devices = await navigator.mediaDevices.enumerateDevices();
+          audioInputs = devices.filter(d => d.kind === 'audioinput' && d.deviceId);
+        } catch {}
+      }
 
-      // Prefer a device whose label does NOT match loopback patterns
-      const realMic = audioInputs.find(d => d.label && !LOOPBACK_LABEL_PATTERN.test(d.label));
-      if (realMic) {
-        deviceId = realMic.deviceId;
-        console.log('[Mic] Selected real microphone:', realMic.label);
-      } else if (audioInputs.length > 0 && audioInputs[0].label) {
-        // No labeled non-loopback found — use the first available and hope
-        // it's the default mic (labels are empty before first permission grant).
-        deviceId = audioInputs[0].deviceId;
-        console.log('[Mic] Falling back to first available input:', audioInputs[0].label);
+      // Filter out all loopback / stereo mix devices
+      const cleanInputs = audioInputs.filter(d => !d.label || !LOOPBACK_LABEL_PATTERN.test(d.label));
+
+      // 1. Check for user-preferred microphone
+      const preferred = preferredMicIdRef.current;
+      if (preferred && cleanInputs.some(d => d.deviceId === preferred)) {
+        deviceId = preferred;
+        console.log('[Mic] Selected preferred microphone:', preferred);
+      } else {
+        // 2. Prefer headset / external / physical mic array over loopback
+        const physicalMic = cleanInputs.find(d => 
+          /mic|headset|earphone|airpods|airpod|buds|airdopes|array/i.test(d.label)
+        ) || cleanInputs[0];
+
+        if (physicalMic) {
+          deviceId = physicalMic.deviceId;
+          console.log('[Mic] Selected physical microphone:', physicalMic.label);
+        }
       }
     } catch (err) {
-      console.warn('[Mic] Device enumeration failed, using system default:', err);
+      console.warn('[Mic] Device enumeration notice:', err);
     }
 
-    // 2. Request the stream with all processing enabled. echoCancellation
-    //    is the critical constraint — it tells Chromium's WebRTC AEC to
-    //    subtract the device's speaker output from the mic input.
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
         channelCount: 1,
-        sampleRate: { ideal: 16000 },  // Whisper optimal; lower = less data
-        echoCancellation: { ideal: true },
-        noiseSuppression: { ideal: true },
-        autoGainControl: { ideal: true },
-      }
+        sampleRate: 16000,
+        // Standard WebRTC constraints
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        // Chromium-specific voice isolation flags — these activate the
+        // hardware Audio Processing Module (APM) inside the audio service,
+        // which actively cancels speaker output from the mic signal. Without
+        // these, YouTube/music playing through laptop speakers bleeds into
+        // dictation because the built-in mic picks up chassis vibrations.
+        googEchoCancellation: true,
+        googExperimentalEchoCancellation: true,
+        googAutoGainControl: true,
+        googNoiseSuppression: true,
+        googHighpassFilter: true,
+        googTypingNoiseDetection: true,
+        googAudioMirroring: false,
+        // Chrome 116+ voice isolation — uses ML-based speaker separation
+        voiceIsolation: true,
+      } as any
     });
 
-    // 3. Verify the constraints actually applied — Chromium can silently
-    //    ignore echoCancellation on some drivers/devices.
     const track = stream.getAudioTracks()[0];
     if (track) {
       const settings = track.getSettings();
-      console.log('[Mic] Active track settings:', JSON.stringify({
-        deviceId: settings.deviceId?.slice(0, 8),
-        label: track.label,
-        echoCancellation: settings.echoCancellation,
-        noiseSuppression: settings.noiseSuppression,
-        autoGainControl: settings.autoGainControl,
-        sampleRate: settings.sampleRate,
-        channelCount: settings.channelCount,
-      }));
-      if (settings.echoCancellation === false) {
-        console.warn('[Mic] WARNING: echoCancellation was requested but the driver/device did not enable it. Speaker audio may leak into dictation.');
-      }
+      console.log('[Mic] Active track:', track.label, '| AEC:', settings.echoCancellation, '| NS:', settings.noiseSuppression);
     }
 
     return stream;
   };
 
-  // Pre-warm microphone permission on initial mount (the actual stream
-  // will be replaced with a fresh one on each recording start).
+  // Pre-warm microphone permission on initial mount
   useEffect(() => {
     requestMicStream()
       .then((stream) => {
@@ -136,6 +169,9 @@ const Pill: React.FC = () => {
       stopAudioAnalyser();
       const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
       const ctx = new AudioContextClass();
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
       audioContextRef.current = ctx;
 
       const analyser = ctx.createAnalyser();
@@ -355,7 +391,7 @@ const Pill: React.FC = () => {
       isRecordingRef.current = true;
       setState('recording');
 
-      // Play themed start chime & start analyser
+      // Start decibel visualizer & play themed start chime
       playEarcon('start', activeSkin);
       startAudioAnalyser(stream);
 
@@ -418,7 +454,6 @@ const Pill: React.FC = () => {
 
   const stopRecording = () => {
     playEarcon('stop', activeSkin);
-    stopAudioAnalyser();
     setState('processing');
 
     if (mediaRecorder.current && mediaRecorder.current.state === 'recording') {
@@ -426,8 +461,10 @@ const Pill: React.FC = () => {
         mediaRecorder.current.stop();
       } catch (err) {
         console.error('Error stopping recorder:', err);
+        stopAudioAnalyser();
       }
     } else {
+      stopAudioAnalyser();
       setState('idle');
       if (window.electronAPI) {
         window.electronAPI.sendAudio('', 'audio/webm');

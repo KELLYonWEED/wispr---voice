@@ -14,6 +14,11 @@ const VALID_MODES: DictationMode[] = ['default', 'code', 'notes'];
 const MAX_VOCAB_TERMS = 50;
 const MAX_AUDIO_BASE64_LENGTH = 32 * 1024 * 1024;
 
+// Configure Chromium flags for maximum WebRTC audio isolation and hardware APM
+app.commandLine.appendSwitch('enable-features', 'WebRtcApmInAudioService');
+app.commandLine.appendSwitch('enable-webrtc-apm-in-audio-service');
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+
 // Request single instance lock. If another copy is already running, hand
 // off to it and exit immediately — continuing init here causes duplicate
 // windows/timers and slow, confusing launches.
@@ -43,13 +48,16 @@ function getVocabularyList(): string[] {
 }
 
 // Whisper's "prompt" parameter accepts a short piece of text used only to
-// bias recognition toward likely vocabulary — it does not inject content
-// into the transcript. A plain comma-joined list of user-provided terms is
-// the documented pattern for this.
+// bias recognition toward likely vocabulary and context. Conditioning on
+// foreground voice dictation helps Whisper ignore background audio/video bleed.
 function buildVocabularyHint(): string | undefined {
   const terms = getVocabularyList();
-  if (terms.length === 0) return undefined;
-  return terms.slice(0, MAX_VOCAB_TERMS).join(', ');
+  // Always include a foreground-voice context prefix so Whisper attends to
+  // the speaker's voice rather than background media. This is vocabulary-
+  // style conditioning (prior spoken text tokens), NOT a system instruction.
+  const contextPrefix = 'Voice dictation: transcribe only the foreground speaker directly addressing the microphone; ignore background audio, music or video playback.';
+  if (terms.length === 0) return contextPrefix;
+  return `${contextPrefix} Recognized vocabulary: ${terms.slice(0, MAX_VOCAB_TERMS).join(', ')}`;
 }
 
 // File logger for operational diagnostics. Never write dictated content or API
@@ -130,13 +138,13 @@ function createMainWindow() {
   log('Creating Main Application Window (Taskbar Visible)...');
 
   mainWindow = new BrowserWindow({
-    width: 820,
-    height: 640,
-    minWidth: 640,
-    minHeight: 480,
+    width: 940,
+    height: 680,
+    minWidth: 760,
+    minHeight: 520,
     frame: false,
     transparent: false,
-    backgroundColor: '#0c0e12',
+    backgroundColor: '#16181d',
     skipTaskbar: false,
     show: true,
     title: 'Wispr Voice',
@@ -594,24 +602,31 @@ app.whenReady().then(() => {
     return updated;
   });
 
-  // Settings IPC handlers — per-user API keys, stored locally via electron-store
+  // Settings IPC handlers — per-user API keys and preferred audio input, stored locally via electron-store
   ipcMain.handle('get-settings', () => {
     return {
       groqApiKey: (store.get('groqApiKey') as string) || '',
-      geminiApiKey: (store.get('apiKey') as string) || ''
+      geminiApiKey: (store.get('apiKey') as string) || '',
+      preferredMicId: (store.get('preferredMicId') as string) || ''
     };
   });
 
-  ipcMain.handle('save-settings', (_event, settings: { groqApiKey?: string; geminiApiKey?: string }) => {
+  ipcMain.handle('save-settings', (_event, settings: { groqApiKey?: string; geminiApiKey?: string; preferredMicId?: string }) => {
     if (typeof settings.groqApiKey === 'string') {
       store.set('groqApiKey', settings.groqApiKey.trim());
     }
     if (typeof settings.geminiApiKey === 'string') {
       store.set('apiKey', settings.geminiApiKey.trim());
     }
+    if (typeof settings.preferredMicId === 'string') {
+      store.set('preferredMicId', settings.preferredMicId.trim());
+      pillWindow?.webContents.send('mic-changed', settings.preferredMicId.trim());
+      log(`[Main] Preferred microphone updated: ${settings.preferredMicId.trim() || 'default'}`);
+    }
     return {
       groqApiKey: (store.get('groqApiKey') as string) || '',
-      geminiApiKey: (store.get('apiKey') as string) || ''
+      geminiApiKey: (store.get('apiKey') as string) || '',
+      preferredMicId: (store.get('preferredMicId') as string) || ''
     };
   });
 

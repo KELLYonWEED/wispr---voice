@@ -1,120 +1,159 @@
 import https from 'node:https';
 
-export const GROQ_MODEL = 'whisper-large-v3';
+// Groq Whisper STT + key validation for Wispr Voice.
+//
+// Whisper's "prompt" parameter is fed directly into its autoregressive text
+// decoder as prior spoken text tokens, NOT as a system instruction. Never
+// pass negative constraints or NL directives — on silent/quiet audio Whisper
+// regurgitates the prompt text verbatim. Use it ONLY for vocabulary biasing.
 
-// No default/fallback API key is bundled with this app. Each user supplies
-// their own key via Settings, which is stored locally via electron-store
-// and never shipped in the app itself. Callers must pass a real key.
+const WHISPER_MODEL = 'whisper-large-v3';
+
 export class MissingApiKeyError extends Error {
-  constructor(service: string) {
-    super(`No ${service} API key configured. Add one in Settings.`);
+  constructor(provider: string) {
+    super(`No ${provider} API key configured. Please add one in Settings.`);
     this.name = 'MissingApiKeyError';
   }
 }
 
+// Keep-alive agent for Groq STT — reuses TCP+TLS across consecutive
+// recordings, cutting ~200ms per request on typical Windows laptops.
 const keepAliveAgent = new https.Agent({
   keepAlive: true,
   keepAliveMsecs: 60000,
-  maxSockets: 10,
+  maxSockets: 6,
   timeout: 15000
 });
 
-// Groq limits uploads to 25 MB. Reject before decoding/base64 expansion so a
-// malformed renderer message cannot allocate an excessive Buffer in main.
-const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
-
+/**
+ * Sends base64-encoded audio to Groq's Whisper endpoint and returns the
+ * raw transcript text. Returns '' for empty/silent recordings. Throws on
+ * network or API errors so callers can fall through to Gemini.
+ */
 export async function transcribeWithGroq(
   audioBase64: string,
-  mimeType = 'audio/webm',
-  apiKey?: string,
-  promptHint?: string
+  mimeType: string,
+  apiKey: string,
+  vocabularyHint?: string
 ): Promise<string> {
-  if (!audioBase64 || audioBase64.length < 300) {
-    return '';
+  const key = (apiKey || '').trim();
+  if (!key) throw new MissingApiKeyError('Groq');
+
+  // Strip data-URL prefix if present
+  const b64Clean = audioBase64.includes('base64,')
+    ? audioBase64.slice(audioBase64.indexOf('base64,') + 7)
+    : audioBase64;
+
+  const audioBuffer = Buffer.from(b64Clean, 'base64');
+  if (audioBuffer.length < 300) return '';
+
+  // Multipart/form-data boundary
+  const boundary = `----WisprGroq${Date.now()}`;
+  const parts: Buffer[] = [];
+
+  const addField = (name: string, value: string) => {
+    parts.push(Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`
+    ));
+  };
+
+  addField('model', WHISPER_MODEL);
+  addField('temperature', '0.0');
+  addField('response_format', 'json');
+
+  // Whisper prompt: ONLY vocabulary biasing, never natural-language directives.
+  if (vocabularyHint && vocabularyHint.trim()) {
+    addField('prompt', vocabularyHint.trim());
   }
 
-  const activeKey = (apiKey || '').trim();
-  if (!activeKey) {
-    throw new MissingApiKeyError('Groq');
-  }
-
-  const estimatedBytes = Math.floor((audioBase64.length * 3) / 4);
-  if (estimatedBytes > MAX_AUDIO_BYTES) {
-    throw new Error('Recording exceeds Groq’s 25 MB upload limit.');
-  }
-  const audioBuffer = Buffer.from(audioBase64, 'base64');
-  if (audioBuffer.length === 0 || audioBuffer.length > MAX_AUDIO_BYTES) {
-    throw new Error('Recording is invalid or exceeds Groq’s 25 MB upload limit.');
-  }
-  
-  const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substring(2);
+  // Audio file part
   const ext = mimeType.includes('wav') ? 'wav' : 'webm';
+  parts.push(Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="recording.${ext}"\r\nContent-Type: ${mimeType || 'audio/webm'}\r\n\r\n`
+  ));
+  parts.push(audioBuffer);
+  parts.push(Buffer.from('\r\n'));
+  parts.push(Buffer.from(`--${boundary}--\r\n`));
 
-  const chunks: Buffer[] = [];
-
-  // Model parameter - Whisper Large V3
-  chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${GROQ_MODEL}\r\n`));
-  // Deterministic transcription
-  chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="temperature"\r\n\r\n0.0\r\n`));
-  // Response format
-  chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\njson\r\n`));
-  // Optional prompt hint — Whisper's "prompt" param biases recognition
-  // toward specific vocabulary (names, terms) without changing what is
-  // actually said; it only nudges word choice among acoustically similar
-  // candidates, so this cannot inject content that wasn't spoken.
-  if (promptHint && promptHint.trim().length > 0) {
-    chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="prompt"\r\n\r\n${promptHint.trim()}\r\n`));
-  }
-  // Binary audio file
-  chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="recording.${ext}"\r\nContent-Type: ${mimeType}\r\n\r\n`));
-  chunks.push(audioBuffer);
-  chunks.push(Buffer.from(`\r\n--${boundary}--\r\n`));
-
-  const payload = Buffer.concat(chunks);
-  const startTime = Date.now();
+  const body = Buffer.concat(parts);
 
   return new Promise((resolve, reject) => {
     const req = https.request('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
-      agent: keepAliveAgent, // Persistent keep-alive TLS connection
+      agent: keepAliveAgent,
       headers: {
-        'Authorization': `Bearer ${activeKey}`,
+        'Authorization': `Bearer ${key}`,
         'Content-Type': `multipart/form-data; boundary=${boundary}`,
-        'Content-Length': payload.length,
+        'Content-Length': body.length,
         'Connection': 'keep-alive'
       },
-      timeout: 8000
+      timeout: 12000
     }, (res) => {
-      let body = '';
+      let responseBody = '';
       res.setEncoding('utf8');
-      res.on('data', (chunk) => body += chunk);
+      res.on('data', (chunk) => (responseBody += chunk));
       res.on('end', () => {
-        const elapsed = Date.now() - startTime;
         if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
           try {
-            const data = JSON.parse(body);
-            const text = (data.text || '').trim();
-            console.log(`[Groq Whisper Large-v3] Transcription complete in ${elapsed}ms: "${text}"`);
-            resolve(text);
+            const parsed = JSON.parse(responseBody);
+            const raw = (parsed.text || '').trim();
+            if (isEmptyOrHallucination(raw)) {
+              resolve('');
+            } else {
+              resolve(raw);
+            }
           } catch (err) {
-            reject(new Error(`Failed to parse Groq response: ${body}`));
+            reject(new Error(`Invalid JSON from Groq Whisper: ${err}`));
           }
         } else {
-          reject(new Error(`Groq API Error (${res.statusCode}): ${body}`));
+          reject(new Error(`Groq transcription failed (${res.statusCode}): ${responseBody}`));
         }
       });
     });
 
-    req.on('error', (err) => {
-      reject(err);
-    });
-
+    req.on('error', (err) => reject(err));
     req.on('timeout', () => {
       req.destroy();
-      reject(new Error('Groq request timed out after 8s'));
+      reject(new Error('Groq Whisper request timed out'));
     });
 
-    req.write(payload);
+    req.write(body);
     req.end();
   });
+}
+
+/**
+ * Detects empty, pure-punctuation, or known Whisper silence hallucinations.
+ * Called before any further processing so hallucinated text never reaches
+ * the smart-format layer, clipboard, or history.
+ */
+function isEmptyOrHallucination(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+
+  // Pure punctuation / symbols with no real words
+  if (!/[a-zA-Z0-9\u00C0-\u024F]/.test(trimmed)) return true;
+
+  const lower = trimmed.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '');
+
+  const hallucinations = [
+    'transcribe only the background audio',
+    'transcribe only the foreground speaker',
+    'transcribe only',
+    'background audio, music or video playback',
+    'video playback',
+    'thank you for watching',
+    'thanks for watching',
+    'thank you',
+    'subtitles by',
+    'subscribe to my channel',
+    'you',
+    'bye',
+  ];
+
+  for (const h of hallucinations) {
+    if (lower === h || lower.startsWith(h)) return true;
+  }
+
+  return false;
 }

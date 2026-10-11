@@ -1,99 +1,78 @@
-# Wispr Voice 🎙️
+# Wispr Voice
 
-> **Fast, privacy-first voice dictation for Windows.**  
-> Press `Ctrl + /` anywhere on your PC, speak naturally, and clean, formatted text lands directly in your focused app — with zero filler words, automatic punctuation, and sub-500ms latency.
+A fast, privacy-first voice dictation app for Windows. Press a hotkey anywhere on your PC, speak naturally, and clean, formatted text gets typed for you — no "um"s, no typos, no cleanup.
 
-Built with Electron + React. Powered by [Groq Whisper Large-v3](https://groq.com) with optional Google Gemini fallback.  
-**Bring Your Own Key (BYOK)** — No accounts, no subscriptions, zero telemetry, and 100% free and open-source.
+Built with Electron + React. Transcription runs on [Groq](https://groq.com) (Whisper Large-v3) with an optional Google Gemini fallback. **Bring your own API key** — there is no account, no subscription, and no server in the middle. Your key is stored locally and talks directly to the provider.
 
----
+![icon](public/icon.png)
 
-## 📥 How to Download & Install (Windows)
+## How it works
 
-### Option 1: Direct Windows Installer (.exe) — *Recommended for Everyone*
-1. Head over to the **[Releases](https://github.com/KELLYonWEED/wispr---voice/releases)** page.
-2. Under **Assets**, click to download:
-   ```text
-   Wispr Voice Setup 0.1.0.exe
-   ```
-3. Run the installer. Wispr Voice will launch and live quietly in your system tray!
+1. Press the recording hotkey (default `Ctrl+/`) anywhere on your system
+2. Speak naturally — the floating pill shows it's listening
+3. Press the hotkey again. Within a second, your words are typed into whatever app you're focused on
 
----
+## Dictation modes
 
-### Option 2: Run From Source — *For Developers*
-If you have [Node.js](https://nodejs.org/) installed:
+| Mode | What it does |
+|---|---|
+| **Default** | Strips filler words, adds punctuation and capitalization, converts spoken URLs/emails/times, and resolves self-corrections ("meet at 2:30, sorry, actually 3:30" → "meet at 3:30") |
+| **Code** | Speak code out loud: "const user name equals get user open paren close paren" → `const userName = getUser()` |
+| **Notes** | For long brain-dumps — breaks stream-of-consciousness into proper sentences and paragraphs |
+
+Every mode runs through a faithfulness verifier: if the formatting layer ever produces output that doesn't trace back to what you actually said, the app silently falls back to the raw transcript instead of showing something wrong.
+
+## Features
+
+- **Customizable hotkeys** — rebind recording and mode-picker shortcuts in Settings (defaults: `Ctrl+/` record, `Ctrl+Shift+M` mode picker)
+- **Custom vocabulary** — add names and niche terms so Whisper recognizes them
+- **History** — last 30 transcriptions, searchable, with a raw-vs-formatted diff view
+- **Tray-resident** — closes to the system tray; hotkeys keep working
+- **Gemini fallback** — if Groq is down or rate-limited, transcription automatically falls back to Gemini (optional second key)
+
+## Getting started
+
+1. Grab a free API key at [console.groq.com/keys](https://console.groq.com/keys) (the free tier is generous)
+2. Launch the app and paste the key into the welcome screen — it's stored locally via [electron-store](https://github.com/sindresorhus/electron-store) and sent only to Groq
+3. Optionally add a Gemini key ([Google AI Studio](https://aistudio.google.com)) as a fallback
+4. Press `Ctrl+/` and start talking
+
+## Development
 
 ```bash
-# 1. Clone this repository
-git clone https://github.com/KELLYonWEED/wispr---voice.git
-
-# 2. Enter the folder
-cd wispr---voice
-
-# 3. Install dependencies
+# install dependencies
 npm install
 
-# 4. Start the app in dev mode (Vite + Electron)
+# run in dev mode (Vite + Electron with hot reload)
 npm run dev
 
-# (Optional) Build your own Windows installer (.exe)
+# build a production bundle into dist-app/
 npm run build
 ```
 
----
+### Project structure
 
-## ⚡ Quick Start (60 Seconds)
+```
+electron/            Main process
+  main.ts            Windows, tray, hotkeys, IPC, dictation pipeline
+  groqClient.ts      Groq Whisper transcription
+  geminiClient.ts    Gemini fallback transcription
+  smartFormatClient.ts  Mode prompts + faithfulness verifier
+  pasteInjector.ts   Types transcript into the focused app
+  db.ts              Local transcript history (electron-store)
+src/
+  components/
+    HistoryView.tsx  History, settings, onboarding
+    Pill.tsx         Floating recording pill + mode picker
+```
 
-1. **Get a Free API Key:**  
-   Go to [console.groq.com/keys](https://console.groq.com/keys) and generate a free API key (the free tier easily covers everyday dictation).
-2. **Paste Your Key:**  
-   Launch Wispr Voice and paste your key on the welcome screen. It is saved locally on your machine via secure `electron-store` and never leaves your PC.
-3. **Start Dictating:**  
-   Press **`Ctrl + /`** anywhere in Windows (VS Code, Slack, Notion, Chrome, Discord, Word), speak naturally, and press **`Ctrl + /`** again. Clean text types out instantly!
+## Privacy
 
----
+- No telemetry, no analytics, no accounts
+- API keys never leave your machine except in direct HTTPS calls to Groq/Google
+- Audio is sent to the transcription provider you configure — nowhere else
+- Transcript history lives in a local JSON file in your user data folder
 
-## 🎯 Dictation Modes
+## License
 
-Switch modes on the fly using **`Ctrl + Shift + M`**:
-
-| Mode | Shortcut | Best For | Example Spoken $\rightarrow$ Typed |
-|---|---|---|---|
-| **Default** | `Ctrl + Shift + M` $\rightarrow$ 1 | Emails, chat, messages | *"meet at two thirty sorry actually three pm"* $\rightarrow$ **"Meet at 3:00 PM"** |
-| **Code** | `Ctrl + Shift + M` $\rightarrow$ 2 | Programming & terminal | *"const user name equals get user"* $\rightarrow$ **`const userName = getUser()`** |
-| **Notes** | `Ctrl + Shift + M` $\rightarrow$ 3 | Long-form thinking | Streams of thought auto-broken into clean, structured paragraphs |
-
-> **Faithfulness Verifier:** If the AI formatting layer ever tries to add words or hallucinate, the app automatically falls back to your verbatim transcript. Zero hallucinations guaranteed.
-
----
-
-## ⚙️ Custom Vocabulary
-
-Never have unique names, gaming tags, or startup codenames butchered:
-1. Open Wispr Voice Settings (`Ctrl + Shift + M` or click tray icon).
-2. Under **Custom Vocabulary**, add your custom terms (e.g. **`Astra`**, `Nothing OS`, `Glyph`).
-3. Whisper will automatically recognize your terms with high precision.
-
----
-
-## 🎨 Unlockable HUD Skins
-
-As you dictate, your word count unlocks stylish floating HUD pill skins:
-- **Obsidian Stealth** — Frosted glass with clean white waveforms
-- **8-Bit Retro CRT** — Cyberpunk cyan/magenta aesthetic with scanline styling
-- **Sakura Blossom** — Pastel blossom aesthetic with warm chime earcons
-- **Neko Companion** — Animated companion with playful sound effects
-
----
-
-## 🛡️ Privacy & Security Architecture
-
-- **Zero Cloud Servers in the Middle:** All HTTPS requests go directly from your PC to Groq or Google.
-- **Zero Telemetry:** No analytics, no tracking pixels, no behavioral logging.
-- **Local Key Vault:** Keys and custom vocabulary reside strictly inside your Windows `%APPDATA%` folder.
-
----
-
-## 📄 License
-
-MIT License — free to use, inspect, modify, and distribute. See [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
